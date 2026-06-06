@@ -17,7 +17,7 @@ use alvr_graphics::{
     GraphicsContext, HandData, LobbyRenderer, LobbyViewParams, SDR_FORMAT_GL, StreamRenderer,
     StreamViewParams,
 };
-use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
+use alvr_packets::{ButtonEntry, ButtonValue, FaceData, FaceExpressions, TrackingData};
 use alvr_session::{
     CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig,
 };
@@ -496,6 +496,116 @@ pub extern "C" fn alvr_send_tracking(
             face: FaceData {
                 eyes_combined,
                 ..Default::default()
+            },
+            body: None,
+            markers: Vec::new(),
+        });
+    }
+}
+
+/// hand_skeleton:
+/// * outer ptr: array of 2 (can be null);
+/// * inner ptr: array of 26 (can be null if hand is absent)
+///
+/// eye_gazes:
+/// * outer ptr: array of 2 (can be null);
+/// * inner ptr: pose (can be null if eye gaze is absent)
+///
+/// fb_face_expressions: can be null; if non-null, must point to an array of 70 floats
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_send_tracking_and_face_data(
+    poll_timestamp_ns: u64,
+    device_motions: *const AlvrDeviceMotion,
+    device_motions_count: u64,
+    hand_skeletons: *const *const AlvrPose,
+    eye_gazes: *const *const AlvrPose,
+    fb_face_expressions: *const f32,
+) {
+    let mut raw_motions = vec![AlvrDeviceMotion::default(); device_motions_count as _];
+    unsafe {
+        ptr::copy_nonoverlapping(
+            device_motions,
+            raw_motions.as_mut_ptr(),
+            device_motions_count as usize,
+        );
+    }
+
+    let device_motions = raw_motions
+        .into_iter()
+        .map(|motion| {
+            (
+                motion.device_id,
+                DeviceMotion {
+                    pose: alvr_common::from_capi_pose(&motion.pose),
+                    linear_velocity: Vec3::from_slice(&motion.linear_velocity),
+                    angular_velocity: Vec3::from_slice(&motion.angular_velocity),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let hand_skeletons = if !hand_skeletons.is_null() {
+        let hand_skeletons = unsafe { slice::from_raw_parts(hand_skeletons, 2) };
+        let hand_skeletons = hand_skeletons
+            .iter()
+            .map(|&hand_skeleton| {
+                (!hand_skeleton.is_null()).then(|| {
+                    let hand_skeleton = unsafe { slice::from_raw_parts(hand_skeleton, 26) };
+
+                    let mut array = [Pose::IDENTITY; 26];
+
+                    for (pose, capi_pose) in array.iter_mut().zip(hand_skeleton.iter()) {
+                        *pose = Pose {
+                            orientation: alvr_common::from_capi_quat(&capi_pose.orientation),
+                            position: Vec3::from_slice(&capi_pose.position),
+                        };
+                    }
+
+                    array
+                })
+            })
+            .collect::<Vec<_>>();
+
+        [hand_skeletons[0], hand_skeletons[1]]
+    } else {
+        [None, None]
+    };
+
+    let eyes_social = if !eye_gazes.is_null() {
+        let eye_gazes = unsafe { slice::from_raw_parts(eye_gazes, 2) };
+        eye_gazes
+            .iter()
+            .map(|&eye_gaze| {
+                (!eye_gaze.is_null()).then(|| {
+                    let eye_gaze = unsafe { &*eye_gaze };
+                    alvr_common::from_capi_quat(&eye_gaze.orientation)
+                })
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_default()
+    } else {
+        [None, None]
+    };
+
+    let eyes_combined = eyes_social[0].or(eyes_social[1]);
+
+    let face_expressions = if !fb_face_expressions.is_null() {
+        let items = unsafe { slice::from_raw_parts(fb_face_expressions, 70) };
+        Some(FaceExpressions::Fb(items.to_vec()))
+    } else {
+        None
+    };
+
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.send_tracking(TrackingData {
+            poll_timestamp: Duration::from_nanos(poll_timestamp_ns),
+            device_motions,
+            hand_skeletons,
+            face: FaceData {
+                eyes_combined,
+                eyes_social,
+                face_expressions,
             },
             body: None,
             markers: Vec::new(),
