@@ -7,6 +7,7 @@ use crate::{
     storage::Config,
     ClientCapabilities, ClientCoreEvent,
 };
+#[cfg(not(any(target_os = "ios", target_os = "visionos")))]
 use alvr_audio::AudioDevice;
 use alvr_common::{
     dbg_connection, debug, error, info,
@@ -33,7 +34,7 @@ use std::{
 
 #[cfg(target_os = "android")]
 use crate::audio;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(not(target_os = "android"), not(any(target_os = "ios", target_os = "visionos"))))]
 use alvr_audio as audio;
 
 const INITIAL_MESSAGE: &str = concat!(
@@ -187,6 +188,9 @@ fn connection_pipeline(
 
     *connection_state_lock = ConnectionState::Connecting;
 
+    #[cfg(any(target_os = "ios", target_os = "visionos"))]
+    let microphone_sample_rate = 48000;
+    #[cfg(not(any(target_os = "ios", target_os = "visionos")))]
     let microphone_sample_rate = AudioDevice::new_input(None)
         .to_con()?
         .input_sample_rate()
@@ -306,7 +310,7 @@ fn connection_pipeline(
 
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
-    let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
+    let mut game_audio_receiver = stream_socket.subscribe_to_stream::<()>(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
@@ -365,53 +369,87 @@ fn connection_pipeline(
     });
 
     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
-        let device = AudioDevice::new_output(None).to_con()?;
-        thread::spawn({
-            let ctx = Arc::clone(&ctx);
-            move || {
-                while is_streaming(&ctx) {
-                    alvr_common::show_err(audio::play_audio_loop(
-                        || is_streaming(&ctx),
-                        &device,
-                        2,
-                        negotiated_config.game_audio_sample_rate,
-                        config.buffering.clone(),
-                        &mut game_audio_receiver,
-                    ));
+        #[cfg(any(target_os = "ios", target_os = "visionos"))]
+        {
+            thread::spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    while is_streaming(&ctx) {
+                        if let Ok(packet) = game_audio_receiver.recv(Duration::from_millis(500)) {
+                            if let Ok((_, data)) = packet.get() {
+                                if let Some(callback) = *crate::c_api::AUDIO_CALLBACK.lock() {
+                                    callback(data.as_ptr(), data.len() as u32, negotiated_config.game_audio_sample_rate);
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-        })
+            })
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "visionos")))]
+        {
+            let device = AudioDevice::new_output(None).to_con()?;
+            thread::spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    while is_streaming(&ctx) {
+                        alvr_common::show_err(audio::play_audio_loop(
+                            || is_streaming(&ctx),
+                            &device,
+                            2,
+                            negotiated_config.game_audio_sample_rate,
+                            config.buffering.clone(),
+                            &mut game_audio_receiver,
+                        ));
+                    }
+                }
+            })
+        }
     } else {
         thread::spawn(|| ())
     };
 
     let microphone_thread = if matches!(settings.audio.microphone, Switch::Enabled(_)) {
-        let device = AudioDevice::new_input(None).to_con()?;
-
-        let microphone_sender = stream_socket.request_stream(AUDIO);
-
-        thread::spawn({
-            let ctx = Arc::clone(&ctx);
-            move || {
-                while is_streaming(&ctx) {
-                    let ctx = Arc::clone(&ctx);
-                    match audio::record_audio_blocking(
-                        Arc::new(move || is_streaming(&ctx)),
-                        microphone_sender.clone(),
-                        &device,
-                        1,
-                        false,
-                    ) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            error!("Audio record error: {e}");
-
-                            continue;
+        #[cfg(any(target_os = "ios", target_os = "visionos"))]
+        {
+            let microphone_sender = stream_socket.request_stream(AUDIO);
+            *crate::c_api::MIC_SENDER.lock() = Some(microphone_sender);
+            thread::spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    while is_streaming(&ctx) {
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                    *crate::c_api::MIC_SENDER.lock() = None;
+                }
+            })
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "visionos")))]
+        {
+            let device = AudioDevice::new_input(None).to_con()?;
+            let microphone_sender = stream_socket.request_stream(AUDIO);
+            thread::spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    while is_streaming(&ctx) {
+                        let ctx = Arc::clone(&ctx);
+                        match audio::record_audio_blocking(
+                            Arc::new(move || is_streaming(&ctx)),
+                            microphone_sender.clone(),
+                            &device,
+                            1,
+                            false,
+                        ) {
+                            Ok(()) => break,
+                            Err(e) => {
+                                error!("Audio record error: {e}");
+                                continue;
+                            }
                         }
                     }
                 }
-            }
-        })
+            })
+        }
     } else {
         thread::spawn(|| ())
     };

@@ -1156,3 +1156,26 @@ pub extern "C" fn alvr_get_frame(
 pub extern "C" fn alvr_rotation_delta(source: AlvrQuat, destination: AlvrQuat) -> AlvrQuat {
     to_capi_quat(from_capi_quat(source).inverse() * from_capi_quat(destination))
 }
+
+pub type AlvrAudioCallback = extern "C" fn(data: *const u8, len: u32, sample_rate: u32);
+
+pub static AUDIO_CALLBACK: Lazy<Mutex<Option<AlvrAudioCallback>>> = Lazy::new(|| Mutex::new(None));
+pub static MIC_SENDER: Lazy<Mutex<Option<alvr_sockets::StreamSender<()>>>> = Lazy::new(|| Mutex::new(None));
+
+#[no_mangle]
+pub extern "C" fn alvr_set_audio_callback(callback: AlvrAudioCallback) {
+    *AUDIO_CALLBACK.lock() = Some(callback);
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_send_microphone_packet(data: *const u8, len: u32) {
+    if let Some(sender) = &mut *MIC_SENDER.lock() {
+        if let Ok(mut buffer) = sender.get_buffer(&()) {
+            let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+            if slice.len() <= buffer.len() {
+                buffer.get_range_mut(0, slice.len()).copy_from_slice(slice);
+                sender.send(buffer).ok();
+            }
+        }
+    }
+}
